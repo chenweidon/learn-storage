@@ -2,7 +2,54 @@ import torch
 import torch.nn as nn
 from piq import SSIMLoss
 from .physics import physics_forward
+import torch.nn.functional as F
 
+
+def pcc_loss(pred, target, eps=1e-8):
+    pred_mean = pred.mean(dim=(1, 2, 3), keepdim=True)
+    target_mean = target.mean(dim=(1, 2, 3), keepdim=True)
+
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+
+    numerator = (pred_centered * target_centered).sum(dim=(1, 2, 3))
+    denominator = torch.sqrt(
+        (pred_centered ** 2).sum(dim=(1, 2, 3)) *
+        (target_centered ** 2).sum(dim=(1, 2, 3)) + eps
+    )
+    pcc = numerator / (denominator + eps)
+    return (1.0 - pcc).mean()
+
+
+def sobel_edge_map(x):
+    kernel_x = torch.tensor(
+        [[[-1, 0, 1],
+          [-2, 0, 2],
+          [-1, 0, 1]]],
+        dtype=x.dtype, device=x.device
+    ).unsqueeze(0)
+
+    kernel_y = torch.tensor(
+        [[[-1, -2, -1],
+          [ 0,  0,  0],
+          [ 1,  2,  1]]],
+        dtype=x.dtype, device=x.device
+    ).unsqueeze(0)
+
+    gx = F.conv2d(x, kernel_x, padding=1)
+    gy = F.conv2d(x, kernel_y, padding=1)
+    return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
+
+
+def edge_loss(pred, target):
+    return F.l1_loss(sobel_edge_map(pred), sobel_edge_map(target))
+
+
+def physics_data_loss(tm, pred_obj, input_speckle, pcc_weight=0.2):
+    pred_speckle = physics_forward(tm, pred_obj)
+    loss_l1 = F.l1_loss(pred_speckle, input_speckle)
+    loss_pcc = pcc_loss(pred_speckle, input_speckle)
+    return loss_l1 + pcc_weight * loss_pcc
 
 class FrequencyLoss(nn.Module):
     """频谱损失，用于压制高频网格伪影。"""
@@ -85,3 +132,63 @@ class HybridLoss(nn.Module):
         loss_dict['tv'] = l_tv.item()
 
         return total_loss, loss_dict
+
+
+
+class WarmRefineLoss(nn.Module):
+    """
+    对 x0 做弱监督，对 xK 做强监督，再加 refined physics consistency
+    """
+    def __init__(
+        self,
+        ssim_loss_fn,
+        w_direct=0.2,
+        w_refined=1.0,
+        w_phy=0.3,
+        direct_ssim_weight=0.2,
+        refined_ssim_weight=0.8,
+        refined_edge_weight=0.2,
+        phy_pcc_weight=0.2,
+    ):
+        super().__init__()
+        self.ssim_loss_fn = ssim_loss_fn
+        self.w_direct = w_direct
+        self.w_refined = w_refined
+        self.w_phy = w_phy
+        self.direct_ssim_weight = direct_ssim_weight
+        self.refined_ssim_weight = refined_ssim_weight
+        self.refined_edge_weight = refined_edge_weight
+        self.phy_pcc_weight = phy_pcc_weight
+
+    def forward(self, tm, x0, xk, gt_obj, input_speckle):
+        # direct 弱监督
+        loss_direct = (
+            F.l1_loss(x0, gt_obj)
+            + self.direct_ssim_weight * self.ssim_loss_fn(x0, gt_obj)
+        )
+
+        # refined 强监督
+        loss_refined = (
+            F.l1_loss(xk, gt_obj)
+            + self.refined_ssim_weight * self.ssim_loss_fn(xk, gt_obj)
+            + self.refined_edge_weight * edge_loss(xk, gt_obj)
+        )
+
+        # refined physics consistency
+        loss_phy = physics_data_loss(
+            tm, xk, input_speckle, pcc_weight=self.phy_pcc_weight
+        )
+
+        total = (
+            self.w_direct * loss_direct
+            + self.w_refined * loss_refined
+            + self.w_phy * loss_phy
+        )
+
+        parts = {
+            "loss_direct": loss_direct.detach().item(),
+            "loss_refined": loss_refined.detach().item(),
+            "loss_phy": loss_phy.detach().item(),
+            "loss_total": total.detach().item(),
+        }
+        return total, parts
