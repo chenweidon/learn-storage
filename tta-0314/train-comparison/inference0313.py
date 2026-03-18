@@ -13,11 +13,12 @@ from PIL import Image
 from torchvision import transforms
 from piq import ssim as compute_ssim
 
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
-from model import Turbo_LightFNO, UNet
+from model import Turbo_LightFNO1, UNet1
 from utils import load_tm, physics_forward
 from config import cfg
 
@@ -71,8 +72,10 @@ def save_comparison_plot(save_path, input_speckle, gt_obj, pred_obj, pred_speckl
 
 
 def normalize_real_input(ts_in):
-    # 保持你原始 GitHub 推理行为：real input 用 min-max
-    return (ts_in - ts_in.min()) / (ts_in.max() - ts_in.min() + 1e-8)
+    # 改成和训练一致：按样本 max 归一化
+    ts_in = ts_in.float()
+    ts_in = ts_in.clamp_min(0.0)
+    return ts_in / (ts_in.max() + 1e-8)
 
 
 def ensure_obj_size(pred_obj):
@@ -87,15 +90,114 @@ def ensure_obj_size(pred_obj):
 
 
 def prepare_model_input(input_speckle_native):
-    # 保持你当前版本的行为：网络输入仍然压到 IMG_SIZE
-    input_low = F.interpolate(
-        input_speckle_native,
-        size=(cfg.IMG_SIZE, cfg.IMG_SIZE),
-        mode='bilinear',
-        align_corners=False,
-    )
-    return input_low
+    # 改成和训练一致：直接输入 native speckle 尺寸
+    return input_speckle_native
 
+# def configure_tta_scope(model, scope='head'):
+#     # 先全部冻结
+#     for p in model.parameters():
+#         p.requires_grad = False
+#
+#     # 如果模型自己带 set_tta_mode，就优先用它
+#     if hasattr(model, 'set_tta_mode'):
+#         model.set_tta_mode(scope)
+#     else:
+#         if scope == 'full':
+#             for p in model.parameters():
+#                 p.requires_grad = True
+#         elif scope == 'head':
+#             for name, p in model.named_parameters():
+#                 if any(key in name for key in ['fc0', 'fc1', 'fc2']):
+#                     p.requires_grad = True
+#         else:
+#             raise ValueError(f"Unsupported TTA scope: {scope}")
+#
+#     trainable = [p for p in model.parameters() if p.requires_grad]
+#     if len(trainable) == 0:
+#         raise RuntimeError("No trainable parameters found for current TTA scope.")
+#     return trainable
+
+def pcc_loss_infer(pred, target, eps=1e-8):
+    pred_mean = pred.mean(dim=(1, 2, 3), keepdim=True)
+    target_mean = target.mean(dim=(1, 2, 3), keepdim=True)
+
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+
+    numerator = (pred_centered * target_centered).sum(dim=(1, 2, 3))
+    denominator = torch.sqrt(
+        (pred_centered ** 2).sum(dim=(1, 2, 3)) *
+        (target_centered ** 2).sum(dim=(1, 2, 3)) + eps
+    )
+    pcc = numerator / (denominator + eps)
+    return (1.0 - pcc).mean()
+
+
+def object_refine_loss(tm, pred_obj, target_native, pcc_weight=0.2, use_alpha=True):
+    pred_speckle = physics_forward(tm, pred_obj)
+
+    if use_alpha:
+        numerator = torch.sum(pred_speckle * target_native)
+        denominator = torch.sum(pred_speckle ** 2)
+        alpha = numerator / (denominator + 1e-8)
+        alpha = torch.clamp(alpha, min=1e-3, max=1e3)
+        pred_speckle = pred_speckle * alpha
+
+    loss_l1 = F.l1_loss(pred_speckle, target_native)
+    loss_pcc = pcc_loss_infer(pred_speckle, target_native)
+    return loss_l1 + pcc_weight * loss_pcc
+
+def configure_tta_scope(model, scope='head'):
+    # 先全部冻结
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # 1) 如果模型自己实现了 set_tta_mode，就优先走模型内部逻辑（主要给 FNO 用）
+    if hasattr(model, 'set_tta_mode'):
+        model.set_tta_mode(scope)
+
+    # 2) 否则按模型结构名来开参数
+    else:
+        if scope == 'full':
+            for p in model.parameters():
+                p.requires_grad = True
+
+        elif scope == 'head':
+            # -------- FNO 风格 head --------
+            fno_keys = ['fc0', 'fc1', 'fc2']
+            has_fno_head = any(any(k in name for k in fno_keys) for name, _ in model.named_parameters())
+
+            # -------- UNet 风格 head --------
+            # 你的 UNet1 结构里最后几层是 up4 和 outc
+            unet_keys = ['up4', 'outc']
+            has_unet_head = any(any(k in name for k in unet_keys) for name, _ in model.named_parameters())
+
+            if has_fno_head:
+                for name, p in model.named_parameters():
+                    if any(k in name for k in fno_keys):
+                        p.requires_grad = True
+
+            elif has_unet_head:
+                for name, p in model.named_parameters():
+                    if any(k in name for k in unet_keys):
+                        p.requires_grad = True
+
+            else:
+                raise RuntimeError(
+                    "TTA_SCOPE='head' but no recognized head layers were found. "
+                    "Please check model parameter names or use scope='full'."
+                )
+
+        else:
+            raise ValueError(f"Unsupported TTA scope: {scope}")
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+
+    if len(trainable) == 0:
+        raise RuntimeError("No trainable parameters found for current TTA scope.")
+
+    print(f"[DEBUG] TTA scope = {scope}, trainable params = {sum(p.numel() for p in trainable)}")
+    return trainable
 
 def direct_predict(model, base_state_dict, input_speckle_native):
     model.load_state_dict(base_state_dict)
@@ -107,6 +209,46 @@ def direct_predict(model, base_state_dict, input_speckle_native):
         pred_obj = ensure_obj_size(pred_obj)
 
     return pred_obj.detach()
+
+def refine_object(model, base_state_dict, tm, input_speckle_native,
+                  num_steps=None, step_size=None):
+    """
+    不更新模型参数，只更新当前样本的 object 变量 x
+    """
+    if num_steps is None:
+        num_steps = getattr(cfg, 'REFINE_STEPS', 3)
+    if step_size is None:
+        step_size = getattr(cfg, 'REFINE_LR', 0.1)
+
+    model.load_state_dict(base_state_dict)
+    model.eval()
+
+    input_low = prepare_model_input(input_speckle_native)
+
+    with torch.no_grad():
+        x0 = model(input_low)
+        x0 = ensure_obj_size(x0)
+
+    x = x0.detach().clone()
+
+    for _ in range(num_steps):
+        x.requires_grad_(True)
+
+        loss = object_refine_loss(
+            tm=tm,
+            pred_obj=x,
+            target_native=input_speckle_native,
+            pcc_weight=getattr(cfg, 'REFINE_PCC_WEIGHT', 0.2),
+            use_alpha=getattr(cfg, 'REFINE_USE_ALPHA', True),
+        )
+
+        grad = torch.autograd.grad(loss, x, create_graph=False)[0]
+
+        with torch.no_grad():
+            x = x - step_size * grad
+            x = torch.clamp(x, 0.0, 1.0)
+
+    return x.detach(), num_steps
 
 
 def compute_initial_physics_residual(tm, pred_obj, target_native):
@@ -121,24 +263,87 @@ def compute_initial_physics_residual(tm, pred_obj, target_native):
     return r0
 
 
-def tta_process(model, base_state_dict, tm, input_speckle_native, max_steps=100, tol=5e-2, patience=3):
-    """
-    尽量保持你原始 GitHub 版 TTA 行为。
-    """
+# def tta_process(model, base_state_dict, tm, input_speckle_native, max_steps=100, tol=5e-2, patience=3):
+#     """
+#     尽量保持你原始 GitHub 版 TTA 行为。
+#     """
+#     model.load_state_dict(base_state_dict)
+#
+#     for param in model.parameters():
+#         param.requires_grad = True
+#
+#     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+#     criterion = nn.L1Loss()
+#
+#     target_native = input_speckle_native
+#     input_low = prepare_model_input(input_speckle_native)
+#
+#     prev_loss = float('inf')
+#     plateau_count = 0
+#     actual_steps = 0
+#
+#     for step in range(max_steps):
+#         pred_obj = model(input_low)
+#         pred_obj = ensure_obj_size(pred_obj)
+#
+#         pred_speckle_sim = physics_forward(tm, pred_obj)
+#
+#         numerator = torch.sum(pred_speckle_sim * target_native)
+#         denominator = torch.sum(pred_speckle_sim ** 2)
+#         alpha = numerator / (denominator + 1e-8)
+#         alpha = torch.clamp(alpha, min=1e-3, max=1e3)
+#         scaled_sim = pred_speckle_sim * alpha.detach()
+#
+#         loss = criterion(scaled_sim, target_native)
+#         current_loss = loss.item()
+#
+#         if step > 0:
+#             rel_change = abs(prev_loss - current_loss) / (prev_loss + 1e-8)
+#             if rel_change < tol:
+#                 plateau_count += 1
+#             else:
+#                 plateau_count = 0
+#             if plateau_count >= patience:
+#                 break
+#
+#         prev_loss = current_loss
+#         actual_steps = step + 1
+#
+#         optimizer.zero_grad()
+#         loss.backward()
+#         optimizer.step()
+#
+#     return pred_obj.detach(), actual_steps
+
+def tta_process(model, base_state_dict, tm, input_speckle_native,
+                max_steps=None, tol=None, patience=None):
+    if max_steps is None:
+        max_steps = getattr(cfg, 'TTA_MAX_STEPS', 20)
+    if tol is None:
+        tol = getattr(cfg, 'TTA_REL_TOL', 5e-3)
+    if patience is None:
+        patience = getattr(cfg, 'TTA_PATIENCE', 3)
+
     model.load_state_dict(base_state_dict)
+    model.train()
 
-    for param in model.parameters():
-        param.requires_grad = True
+    trainable_params = configure_tta_scope(model, getattr(cfg, 'TTA_SCOPE', 'head'))
+    optimizer = optim.Adam(trainable_params, lr=getattr(cfg, 'TTA_LR', 5e-4))
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.L1Loss()
-
     target_native = input_speckle_native
     input_low = prepare_model_input(input_speckle_native)
+
+    # 保存 direct 初值，作为 trust region 中心
+    with torch.no_grad():
+        x0 = model(input_low).detach()
+        x0 = ensure_obj_size(x0)
 
     prev_loss = float('inf')
     plateau_count = 0
     actual_steps = 0
+    best_pred = x0.clone()
+    best_loss = float('inf')
 
     for step in range(max_steps):
         pred_obj = model(input_low)
@@ -150,10 +355,18 @@ def tta_process(model, base_state_dict, tm, input_speckle_native, max_steps=100,
         denominator = torch.sum(pred_speckle_sim ** 2)
         alpha = numerator / (denominator + 1e-8)
         alpha = torch.clamp(alpha, min=1e-3, max=1e3)
+
         scaled_sim = pred_speckle_sim * alpha.detach()
 
-        loss = criterion(scaled_sim, target_native)
+        loss_data = criterion(scaled_sim, target_native)
+        loss_prior = F.l1_loss(pred_obj, x0)
+        loss = loss_data + getattr(cfg, 'TTA_TRUST_WEIGHT', 0.05) * loss_prior
+
         current_loss = loss.item()
+
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_pred = pred_obj.detach().clone()
 
         if step > 0:
             rel_change = abs(prev_loss - current_loss) / (prev_loss + 1e-8)
@@ -161,6 +374,7 @@ def tta_process(model, base_state_dict, tm, input_speckle_native, max_steps=100,
                 plateau_count += 1
             else:
                 plateau_count = 0
+
             if plateau_count >= patience:
                 break
 
@@ -171,8 +385,8 @@ def tta_process(model, base_state_dict, tm, input_speckle_native, max_steps=100,
         loss.backward()
         optimizer.step()
 
-    return pred_obj.detach(), actual_steps
-
+    model.eval()
+    return best_pred.detach(), actual_steps
 
 def normalize_stem(filename: str) -> str:
     stem = os.path.splitext(filename)[0].lower().strip()
@@ -231,10 +445,12 @@ def load_real_pairs():
 def build_model(model_type: str):
     model_type = model_type.lower()
     if model_type == 'unet':
-        return UNet(n_channels=1, n_classes=1).to(cfg.DEVICE)
-    if model_type == 'fno':
-        return Turbo_LightFNO().to(cfg.DEVICE)
-    raise ValueError(f'Unsupported MODEL_TYPE: {model_type}')
+        model = UNet1(n_channels=1, n_classes=1).to(cfg.DEVICE)
+    elif model_type == 'fno':
+        model = Turbo_LightFNO1().to(cfg.DEVICE)
+    else:
+        raise ValueError(f'Unsupported MODEL_TYPE: {model_type}')
+    return model
 
 
 def run_direct_mode(model, base_state_dict, tm, ts_in):
@@ -294,6 +510,27 @@ def run_gated_mode(model, base_state_dict, tm, ts_in):
     )
     return pred_obj, acc_step, r0, 'full'
 
+def run_refine_mode(model, base_state_dict, tm, ts_in):
+    # 先算 direct 初值对应的 r0，便于和其他模式统一日志
+    pred0 = direct_predict(model, base_state_dict, ts_in)
+    pred0_sim = physics_forward(tm, pred0)
+
+    numerator = torch.sum(pred0_sim * ts_in)
+    denominator = torch.sum(pred0_sim ** 2)
+    alpha = numerator / (denominator + 1e-8)
+    alpha = torch.clamp(alpha, min=1e-3, max=1e3)
+    r0 = F.l1_loss(pred0_sim * alpha, ts_in).item()
+
+    pred_obj, acc_step = refine_object(
+        model=model,
+        base_state_dict=base_state_dict,
+        tm=tm,
+        input_speckle_native=ts_in,
+        num_steps=getattr(cfg, 'REFINE_STEPS', 3),
+        step_size=getattr(cfg, 'REFINE_LR', 0.1),
+    )
+
+    return pred_obj, acc_step, r0, 'refine'
 
 def run_one_sample(eval_mode, model, base_state_dict, tm, ts_in):
     eval_mode = eval_mode.lower()
@@ -304,6 +541,8 @@ def run_one_sample(eval_mode, model, base_state_dict, tm, ts_in):
         return run_all_tta_mode(model, base_state_dict, tm, ts_in)
     elif eval_mode == 'gated':
         return run_gated_mode(model, base_state_dict, tm, ts_in)
+    elif eval_mode == 'refine':
+        return run_refine_mode(model, base_state_dict, tm, ts_in)
     else:
         raise ValueError(f'Unsupported EVAL_MODE: {eval_mode}')
 
@@ -321,15 +560,26 @@ def main():
 
     model = build_model(model_type)
 
-    weights_path = os.path.join(cfg.weight_path, f'pretrained_{model_type}.pth')
-    if not os.path.exists(weights_path):
-        print(f'Error: 权重文件未找到: {weights_path}')
-        return
+    # weights_path = os.path.join(cfg.weight_path, f'pretrained_{model_type}.pth')
+    # if not os.path.exists(weights_path):
+    #     print(f'Error: 权重文件未找到: {weights_path}')
+    #     return
 
-    state_dict = torch.load(weights_path, map_location=cfg.DEVICE)
-    model.load_state_dict(state_dict)
-    base_state_dict = copy.deepcopy(state_dict)
-    print(f'Model loaded from: {weights_path}')
+    best_model_path = os.path.join(cfg.weight_path, getattr(cfg, 'BEST_MODEL_NAME', 'best_pretrained_unet.pth'))
+    fallback_model_path = os.path.join(cfg.RESULT_DIR, f'pretrained_{getattr(cfg, "MODEL_TYPE").lower()}.pth')
+
+    if os.path.exists(best_model_path):
+        model_path = best_model_path
+    else:
+        model_path = fallback_model_path
+
+    print(f"Model loaded from: {model_path}")
+    base_state_dict = torch.load(model_path, map_location=cfg.DEVICE)
+
+    # state_dict = torch.load(weights_path, map_location=cfg.DEVICE)
+    # model.load_state_dict(state_dict)
+    # base_state_dict = copy.deepcopy(state_dict)
+    # print(f'Model loaded from: {weights_path}')
 
     transform_in = transforms.Compose([
         transforms.Resize((cfg.SPECKLE_SIZE, cfg.SPECKLE_SIZE)),
@@ -345,7 +595,7 @@ def main():
         print(f'No valid input/label pairs found under: {cfg.TEST_DATA_PATH}')
         return
 
-    save_vis_dir = os.path.join(cfg.RESULT_DIR, f'{eval_mode}_vis_{model_type}\\5')
+    save_vis_dir = os.path.join(cfg.RESULT_DIR, f'vis_{model_type}\\3')
     os.makedirs(save_vis_dir, exist_ok=True)
     print(f'Results will be saved to: {save_vis_dir}')
 
